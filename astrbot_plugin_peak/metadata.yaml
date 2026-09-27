@@ -1,0 +1,6 @@
+name: astrbot_plugin_peak
+display_name: PEAK 每日地图
+desc: 获取 PEAK 每日地图和资源数量
+version: 1.0.0
+author: OpenAI
+repo: https://github.com/Lumosion/AstrbotPlugin.git
