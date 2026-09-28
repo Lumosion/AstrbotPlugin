@@ -1,0 +1,3 @@
+[submodule "astrbot_plugin_peak"]
+	path = astrbot_plugin_peak
+	url = https://github.com/Lumosion/astrbot_plugin_peak.git
