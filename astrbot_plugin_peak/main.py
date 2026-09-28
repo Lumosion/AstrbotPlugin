@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import date as date_cls, datetime, timedelta, timezone
 from io import BytesIO
+import json
+import os
 import re
 import tempfile
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import httpx
@@ -12,10 +15,82 @@ from PIL import Image, ImageDraw, ImageFont
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image as CompImage
+from astrbot.api.message_components import Plain as CompPlain
 from astrbot.api.star import Context, Star, register
 
 PLUGIN_NAME = "astrbot_plugin_peak"
 DEFAULT_URL = "https://peak.joaqu1m.com/zh-cn/"
+ROTATION_URL = "https://peak.joaqu1m.com/assets/data/rotation.js"
+ICON_BASE_URL = "https://peak.joaqu1m.com/assets/img/biomes/"
+ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+
+# 区域中文名 -> 站点图标文件名（与站点 BIOME_SLUGS 一致）。
+REGION_ICON_SLUGS = {
+    "海岸": "shore",
+    "雨林": "tropics",
+    "森蕈": "roots",
+    "雪山": "alpine",
+    "方山": "mesa",
+    "火山": "caldera",
+    "雾沼": "gloom",
+    "熔炉": "caldera",
+    "城塞": "the-citadel",
+    "顶峰": "peak",
+}
+
+# 站点轮换基准：2025-06-14 17:00 UTC 为第 0 天，之后每天 +1，对轮换表长度取模。
+ROTATION_EPOCH = datetime(2025, 6, 14, 17, 0, 0, tzinfo=timezone.utc)
+DAY_SECONDS = 86400
+
+# 轮换表里的内部名称 -> 中文区域名。
+BIOME_NAME_TRANSLATIONS = {
+    "Shore": "海岸",
+    "Tropics": "雨林",
+    "Roots": "森蕈",
+    "Alpine": "雪山",
+    "Mesa": "方山",
+    "Caldera": "火山",
+    "Volcano": "火山",
+    "Gloom": "雾沼",
+    "Swamp": "雾沼",
+    "Kiln": "熔炉",
+    "The Kiln": "熔炉",
+    "Citadel": "城塞",
+    "The Citadel": "城塞",
+    "Temple": "城塞",
+    "The Peak": "顶峰",
+    "Peak": "顶峰",
+}
+
+# 轮换表里的变体名 -> 中文变体名（含站点使用的别名写法）。
+ROTATION_VARIANT_TRANSLATIONS = {
+    "Redwood Clearcut": "砍伐林",
+    "Redwoods Deep Woods": "深林",
+    "Spiky": "冰刺",
+    "Spikes": "冰刺",
+    "Tumbler Hell": "翻滚者地狱",
+    "Scorpions Hell": "蝎子地狱",
+    "Dynamite Hell": "炸药地狱",
+    "Cactus Hell": "仙人掌地狱",
+    "Cactus Forest": "仙人掌森林",
+    "Geyser Hell": "间歇泉地狱",
+    "Jelly Hell": "水母",
+    "Snake Beach": "蛇滩",
+    "Black Sand": "黑沙",
+    "Red Beach": "红色沙滩",
+    "Blue Beach": "蓝灰色沙滩",
+    "Sky Jungle": "天空丛林",
+    "Cave Mania": "洞穴狂热",
+    "Deep Water": "深水",
+    "Deep Woods": "深林",
+    "Clearcut": "砍伐林",
+    "Pillars": "柱状地形",
+    "Thorny": "荆棘",
+    "Bombs": "炸弹",
+    "Ivy": "常春藤",
+    "Lava": "熔岩",
+}
 
 VARIANT_TRANSLATIONS = {
     "Bombs": "炸弹",
@@ -149,7 +224,7 @@ class PeakFetchError(Exception):
     PLUGIN_NAME,
     "OpenAI",
     "获取 PEAK 每日地图，无需 AI。",
-    "1.0.0",
+    "1.0.1",
     "https://peak.joaqu1m.com/zh-cn/",
 )
 class PeakPlugin(Star):
@@ -162,9 +237,11 @@ class PeakPlugin(Star):
             write=10.0,
             pool=10.0,
         )
+        self._rotation_maps: Optional[List[Dict[str, Any]]] = None
 
-    async def _fetch_page(self) -> str:
-        headers = {
+    @staticmethod
+    def _build_headers() -> Dict[str, str]:
+        return {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -173,13 +250,18 @@ class PeakPlugin(Star):
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
 
+    async def _fetch_page(self, day: Optional[str] = None) -> str:
+        url = self.url
+        if day:
+            url = f"{self.url}?d={day}&b=0&v=top"
+
         try:
             async with httpx.AsyncClient(
                 timeout=self.timeout,
-                headers=headers,
+                headers=self._build_headers(),
                 follow_redirects=True,
             ) as client:
-                response = await client.get(self.url)
+                response = await client.get(url)
 
             response.raise_for_status()
 
@@ -193,6 +275,101 @@ class PeakPlugin(Star):
             raise PeakFetchError(f"无法连接 PEAK 网站：{exc}") from exc
 
         return response.text
+
+    async def _fetch_rotation_maps(self) -> List[Dict[str, Any]]:
+        """读取站点轮换表，用于按日期推算地图。"""
+
+        if self._rotation_maps is not None:
+            return self._rotation_maps
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                headers=self._build_headers(),
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(ROTATION_URL)
+
+            response.raise_for_status()
+            text = response.text
+
+        except httpx.HTTPError as exc:
+            raise PeakFetchError(f"无法获取 PEAK 轮换数据：{exc}") from exc
+
+        match = re.search(
+            r"window\.PEAK_ROTATION\s*=\s*(\{.*?\})\s*;",
+            text,
+            re.DOTALL,
+        )
+        if not match:
+            raise PeakFetchError("PEAK 轮换数据格式无法识别。")
+
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError as exc:
+            raise PeakFetchError("PEAK 轮换数据解析失败。") from exc
+
+        maps = data.get("maps")
+        if not isinstance(maps, list) or not maps:
+            raise PeakFetchError("PEAK 轮换数据为空。")
+
+        self._rotation_maps = maps
+        return maps
+
+    @staticmethod
+    def _rotation_index(day: str) -> int:
+        """把日期换算成轮换表索引（与站点算法一致）。"""
+
+        try:
+            target = datetime.strptime(day, "%Y-%m-%d").replace(
+                hour=18,
+                tzinfo=timezone.utc,
+            )
+        except ValueError as exc:
+            raise PeakFetchError(f"日期格式无效：{day}，应为 YYYY-MM-DD。") from exc
+
+        delta = target - ROTATION_EPOCH
+        return int(delta.total_seconds() // DAY_SECONDS)
+
+    @staticmethod
+    def _format_rotation_stage(biome: str, variant: str) -> str:
+        region = BIOME_NAME_TRANSLATIONS.get(biome, biome)
+        variant = (variant or "").strip()
+        if not variant:
+            return region
+
+        variant_name = ROTATION_VARIANT_TRANSLATIONS.get(variant)
+        if not variant_name:
+            variant_name = PeakPlugin._normalize_stage(variant)
+        return f"{region}（{variant_name}）"
+
+    async def _resolve_rotation(
+        self,
+        day: str,
+    ) -> tuple[str, List[str]]:
+        """按日期从轮换表推算地图路线。"""
+
+        maps = await self._fetch_rotation_maps()
+        index = self._rotation_index(day) % len(maps)
+        entry = maps[index]
+
+        biomes = entry.get("biomes") or []
+        variants = entry.get("variants") or []
+        final = entry.get("final") or ""
+
+        stages = [
+            self._format_rotation_stage(
+                biome,
+                variants[position] if position < len(variants) else "",
+            )
+            for position, biome in enumerate(biomes)
+        ]
+
+        final_region = BIOME_NAME_TRANSLATIONS.get(final, final)
+        if final_region and final_region not in stages:
+            stages.append(final_region)
+
+        return day, stages
 
     @staticmethod
     def _clean_text(text: str) -> str:
@@ -259,21 +436,27 @@ class PeakPlugin(Star):
 
     @staticmethod
     def _stage_description(stage: str) -> str:
+        """返回区域/变体介绍；无特殊变体时返回空字符串。"""
+
         stage_parts = stage.split("（", 1)
         base_name = stage_parts[0].strip()
         variant_name = ""
         if len(stage_parts) == 2:
             variant_name = stage_parts[1].rstrip("）").strip()
 
-        for region, description, _ in BIOME_TABLE:
-            if base_name == region:
-                if variant_name:
-                    for variant, variant_description in _:
-                        normalized_variant = PeakPlugin._normalize_stage(variant)
-                        if variant_name == normalized_variant:
-                            return variant_description
-                return description
-        return "网页暂未提供该区域的简介。"
+        if not variant_name:
+            return ""
+
+        for region, _, variants in BIOME_TABLE:
+            if base_name != region:
+                continue
+            for variant, variant_description in variants:
+                normalized_variant = PeakPlugin._normalize_stage(variant)
+                if variant_name == normalized_variant:
+                    return variant_description
+            return ""
+
+        return ""
 
     @staticmethod
     def _format_variant_table() -> str:
@@ -369,22 +552,85 @@ class PeakPlugin(Star):
 
         return region_icons
 
+    @staticmethod
+    def _load_local_icon(region: str) -> Optional[Image.Image]:
+        """从插件本地 icons 目录读取区域图标。"""
+
+        slug = REGION_ICON_SLUGS.get(region)
+        if not slug:
+            return None
+
+        path = os.path.join(ICON_DIR, f"{slug}.png")
+        if not os.path.isfile(path):
+            return None
+
+        try:
+            with Image.open(path) as icon:
+                return icon.convert("RGBA")
+        except OSError as exc:
+            logger.warning(f"读取本地图标失败 {path}: {exc}")
+            return None
+
+    async def _download_icon(
+        self,
+        client: httpx.AsyncClient,
+        region: str,
+    ) -> Optional[Image.Image]:
+        """联网下载区域图标并缓存到本地 icons 目录。"""
+
+        slug = REGION_ICON_SLUGS.get(region)
+        if not slug:
+            return None
+
+        url = f"{ICON_BASE_URL}{slug}.png"
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.warning(f"无法下载 {region} 地图图标 {url}: {exc}")
+            return None
+
+        try:
+            os.makedirs(ICON_DIR, exist_ok=True)
+            with open(os.path.join(ICON_DIR, f"{slug}.png"), "wb") as handle:
+                handle.write(response.content)
+            with Image.open(BytesIO(response.content)) as icon:
+                return icon.convert("RGBA")
+        except OSError as exc:
+            logger.warning(f"保存 {region} 地图图标失败：{exc}")
+            return None
+
     async def _create_route_image(
         self,
-        html: str,
+        html: Optional[str],
         date: Optional[str],
         stages: List[str],
     ) -> Optional[str]:
         try:
-            soup = BeautifulSoup(html, "html.parser")
-            icon_urls = self._extract_stage_icon_urls(soup, stages)
+            icon_urls: dict[str, str] = {}
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
+                icon_urls = self._extract_stage_icon_urls(soup, stages)
             stage_icons: dict[str, Image.Image] = {}
 
             async with httpx.AsyncClient(
                 timeout=self.timeout,
                 follow_redirects=True,
             ) as client:
+                for stage in stages:
+                    region = stage.split("（", 1)[0].strip()
+                    if region in stage_icons:
+                        continue
+
+                    icon = self._load_local_icon(region)
+                    if icon is None:
+                        icon = await self._download_icon(client, region)
+                    if icon is not None:
+                        stage_icons[region] = icon
+
                 for region, icon_url in icon_urls.items():
+                    if region in stage_icons:
+                        continue
                     try:
                         response = await client.get(icon_url)
                         response.raise_for_status()
@@ -464,12 +710,14 @@ class PeakPlugin(Star):
                     )
 
                 draw.text((220, y + 18), stage, fill="#FFFFFF", font=stage_font)
-                draw.text(
-                    (220, y + 62),
-                    self._stage_description(stage),
-                    fill="#B8C7D9",
-                    font=date_font,
-                )
+                description = self._stage_description(stage)
+                if description:
+                    draw.text(
+                        (220, y + 62),
+                        description,
+                        fill="#B8C7D9",
+                        font=date_font,
+                    )
 
             output = tempfile.NamedTemporaryFile(
                 prefix="astrbot_peak_",
@@ -503,6 +751,10 @@ class PeakPlugin(Star):
     def _parse(self, html: str) -> str:
         date, stages = self._extract_route_data(html)
 
+        return self._format_result(date, stages)
+
+    @staticmethod
+    def _format_result(date: Optional[str], stages: List[str]) -> str:
         result: List[str] = [
             "🏔️ PEAK 今日地图",
             "",
@@ -520,9 +772,28 @@ class PeakPlugin(Star):
 
         return "\n".join(result)
 
+    @staticmethod
+    def _parse_day_argument(arguments: List[str]) -> Optional[str]:
+        """从命令参数中解析 YYYY-MM-DD 日期。"""
+
+        for argument in arguments:
+            match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", argument)
+            if not match:
+                continue
+            year, month, day = (int(part) for part in match.groups())
+            try:
+                return date_cls(year, month, day).isoformat()
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _today_iso() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     @filter.command("peak")
     async def peak(self, event: AstrMessageEvent):
-        """获取 PEAK 今日地图类型和变体名称。"""
+        """获取 PEAK 今日地图类型和变体名称，可指定日期。"""
 
         try:
             message = getattr(event, "message_str", "") or ""
@@ -534,16 +805,36 @@ class PeakPlugin(Star):
                 yield event.plain_result(self._format_variant_table())
                 return
 
-            html = await self._fetch_page()
-            result = self._parse(html)
-            date, stages = self._extract_route_data(html)
-            image_path = await self._create_route_image(html, date, stages)
-            yield event.plain_result(result)
+            day = self._parse_day_argument(arguments)
+            target_day = day or self._today_iso()
+
+            date: Optional[str] = None
+            stages: List[str] = []
+            try:
+                date, stages = await self._resolve_rotation(target_day)
+            except PeakFetchError as exc:
+                logger.warning(f"PEAK 轮换数据不可用，回退网页解析：{exc}")
+
+            if not stages:
+                html = await self._fetch_page(day)
+                date, stages = self._extract_route_data(html)
+                if day:
+                    date = day
+
+            result = self._format_result(date, stages)
+            image_path = await self._create_route_image(None, date, stages)
 
             if image_path:
                 if hasattr(event, "track_temporary_local_file"):
                     event.track_temporary_local_file(image_path)
-                yield event.image_result(image_path)
+                yield event.chain_result(
+                    [
+                        CompPlain(result),
+                        CompImage.fromFileSystem(image_path),
+                    ]
+                )
+            else:
+                yield event.plain_result(result)
 
         except PeakFetchError as exc:
             logger.warning(f"PEAK 插件获取数据失败：{exc}")
